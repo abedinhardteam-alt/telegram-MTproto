@@ -1,0 +1,1160 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telegram Manager</title>
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+  import {
+    getAuth, signInWithEmailAndPassword,
+    onAuthStateChanged, signOut, setPersistence, browserLocalPersistence
+  } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+  import {
+    getFirestore, doc, setDoc, getDoc, updateDoc
+  } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+  // ══════════════════════════════════
+  //  🔥 FIREBASE CONFIG — এখানে আপনার config দিন
+  // ══════════════════════════════════
+  const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_PROJECT.firebaseapp.com",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId: "YOUR_APP_ID"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  // Persist session across refreshes
+  await setPersistence(auth, browserLocalPersistence);
+
+  // ── Expose to window ──
+  window._fbAuth = auth;
+  window._fbDb = db;
+
+
+  window.fbSignIn = async (email, password) => {
+    const cred = await signInWithEmailAndPassword(auth, email, password);
+    return cred.user;
+  };
+
+  window.fbSignOut = async () => {
+    await signOut(auth);
+  };
+
+  window.fbSaveTgSession = async (uid, data) => {
+    await setDoc(doc(db, 'users', uid), data, { merge: true });
+  };
+
+  window.fbGetTgSession = async (uid) => {
+    const snap = await getDoc(doc(db, 'users', uid));
+    return snap.exists() ? snap.data() : null;
+  };
+
+  window.fbUpdateTgDialogs = async (uid, dialogs) => {
+    await updateDoc(doc(db, 'users', uid), { dialogs, dialogsUpdated: Date.now() });
+  };
+
+  // Auth state listener — fires on page load / refresh
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      window._fbCurrentUser = user;
+      window.dispatchEvent(new CustomEvent('fb-authed', { detail: user }));
+    } else {
+      window._fbCurrentUser = null;
+      window.dispatchEvent(new CustomEvent('fb-signed-out'));
+    }
+  });
+
+  console.log('Firebase initialized ✅');
+</script>
+
+<!-- MTProto Library -->
+<script type="module">
+  let _mtClient = null;
+  let _getSRPParams = null;
+
+  // @mtproto/core saves session keys WITHOUT any prefix, e.g.:
+  // dc1_auth_key, dc2_auth_key, dc1_server_salt, dc, etc.
+  // We collect ALL localStorage keys after login and store in Firebase.
+
+  window.tgmCollectSession = function() {
+    const session = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k) session[k] = localStorage.getItem(k);
+      }
+    } catch(e) {}
+    return session;
+  };
+
+  window.tgmRestoreSession = function(session) {
+    if (!session || typeof session !== 'object') return;
+    try {
+      Object.entries(session).forEach(([k, v]) => {
+        if (v != null) localStorage.setItem(k, v);
+      });
+    } catch(e) {}
+  };
+
+  window.tgmClearSession = function() {
+    try {
+      // Only clear DC/auth keys, not unrelated app data
+      const toRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k.startsWith('dc') || k === 'dc')) toRemove.push(k);
+      }
+      toRemove.forEach(k => localStorage.removeItem(k));
+    } catch(e) {}
+  };
+
+  // Debug helper — logs all localStorage keys to console after login
+  window.tgmDebugSession = function() {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+    console.log('[TGM Session Keys]', keys);
+    return keys;
+  };
+
+  async function ensureClient(apiId, apiHash) {
+    if (_mtClient) return _mtClient;
+    const mod = await import('https://esm.sh/@mtproto/core@6.3.0/envs/browser');
+    const MTProto = mod.default;
+    _getSRPParams = mod.getSRPParams;
+    _mtClient = new MTProto({ api_id: Number(apiId), api_hash: apiHash });
+    return _mtClient;
+  }
+
+  window.tgmConnect = async function(apiId, apiHash) {
+    await ensureClient(apiId, apiHash);
+    return true;
+  };
+
+  window.tgmCall = async function(method, params = {}, options = {}, _retried = false) {
+    if (!_mtClient) throw new Error('আগে Connect করুন');
+    try {
+      return await _mtClient.call(method, params, options);
+    } catch (error) {
+      const code = error?.error_code;
+      const msg = error?.error_message || '';
+      if (code === 303) {
+        const dcId = Number(msg.split('_MIGRATE_')[1]);
+        if (dcId) { _mtClient.setDefaultDc(dcId); return window.tgmCall(method, params, options, _retried); }
+      }
+      if (code === 420 && !_retried) {
+        const seconds = Number(msg.split('FLOOD_WAIT_')[1]) || 0;
+        if (seconds > 0 && seconds <= 30) {
+          await new Promise(r => setTimeout(r, (seconds + 1) * 1000));
+          return window.tgmCall(method, params, options, true);
+        }
+      }
+      throw error;
+    }
+  };
+
+  window.tgmGetSRPParams = async function(args) {
+    if (!_getSRPParams) throw new Error('Library লোড হয়নি');
+    return _getSRPParams(args);
+  };
+
+  window.tgmReset = function() { _mtClient = null; };
+</script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+  :root {
+    --bg: #0a0e17;
+    --surface: #111827;
+    --surface2: #1a2236;
+    --border: #1f2d45;
+    --accent: #3b82f6;
+    --accent-glow: rgba(59,130,246,0.15);
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --radius: 12px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(59,130,246,0.08), transparent);
+  }
+
+  .screen { display: none; }
+  .screen.active { display: flex; }
+
+  /* ══════════════════════════════════
+     FIREBASE AUTH SCREEN
+  ══════════════════════════════════ */
+  #screen-firebase {
+    align-items: center; justify-content: center;
+    min-height: 100vh; padding: 20px;
+    flex-direction: column;
+  }
+
+  .auth-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 40px 36px;
+    width: 100%; max-width: 420px;
+    box-shadow: 0 0 60px rgba(59,130,246,0.08);
+  }
+
+  .logo-wrap {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 28px;
+  }
+  .logo-icon {
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    box-shadow: 0 4px 20px rgba(59,130,246,0.3);
+  }
+  .logo-text h1 { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; }
+  .logo-text p { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+
+
+  label {
+    display: block; font-size: 12px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 7px;
+  }
+
+  input, textarea, select {
+    width: 100%; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 10px;
+    color: var(--text); padding: 11px 14px;
+    font-size: 14px; font-family: inherit; outline: none;
+    transition: border-color .2s, box-shadow .2s;
+    margin-bottom: 14px;
+  }
+  input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+  textarea { resize: vertical; min-height: 80px; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 11px 20px; border-radius: 10px;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+    border: none; transition: all .15s; font-family: inherit; white-space: nowrap;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #2563eb; }
+  .btn-ghost { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+  .btn-ghost:hover:not(:disabled) { color: var(--text); border-color: var(--muted); }
+  .btn-danger { background: rgba(239,68,68,0.12); color: var(--red); border: 1px solid rgba(239,68,68,0.2); }
+  .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,0.2); }
+  .btn-green { background: var(--green); color: #000; }
+  .btn-green:hover:not(:disabled) { background: #16a34a; }
+  .btn-full { width: 100%; }
+  .btn-row { display: flex; gap: 8px; }
+  .btn-row .btn { flex: 1; }
+
+  .status-msg { font-size: 13px; min-height: 20px; margin-top: 10px; text-align: center; }
+
+  .firebase-note {
+    background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2);
+    border-radius: 10px; padding: 12px 14px; margin-bottom: 20px;
+    font-size: 12px; color: var(--muted); line-height: 1.6;
+  }
+  .firebase-note b { color: var(--accent); }
+
+  /* ══════════════════════════════════
+     TELEGRAM LOGIN SCREEN
+  ══════════════════════════════════ */
+  #screen-login {
+    align-items: center; justify-content: center;
+    min-height: 100vh; padding: 20px;
+  }
+  .login-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 40px 36px;
+    width: 100%; max-width: 420px;
+    box-shadow: 0 0 60px rgba(59,130,246,0.06);
+  }
+  .step { display: none; }
+  .step.active { display: block; }
+
+  .note {
+    font-size: 12px; color: var(--muted); background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 18px; line-height: 1.6;
+  }
+  .note a { color: var(--accent); text-decoration: none; }
+
+  /* ══════════════════════════════════
+     MAIN APP
+  ══════════════════════════════════ */
+  #screen-app { flex-direction: column; min-height: 100vh; }
+
+  .topbar {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 0 24px; height: 58px;
+    display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 100; backdrop-filter: blur(10px);
+  }
+  .topbar-left { display: flex; align-items: center; gap: 10px; }
+  .topbar-logo { font-size: 16px; font-weight: 800; color: var(--accent); }
+  .user-pill {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 20px; padding: 5px 12px 5px 5px;
+    font-size: 13px; font-weight: 600;
+  }
+  .user-avatar {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: #fff;
+  }
+
+  .app-body {
+    display: grid; grid-template-columns: 280px 1fr;
+    flex: 1; min-height: calc(100vh - 58px);
+  }
+
+  /* Sidebar */
+  .sidebar {
+    background: var(--surface); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sidebar-top {
+    padding: 16px; border-bottom: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .sidebar-label {
+    font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.8px; padding: 4px 4px 0;
+  }
+  .group-list { flex: 1; overflow-y: auto; padding: 8px; }
+  .group-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-radius: 10px;
+    cursor: pointer; transition: background .12s;
+    border: 1px solid transparent; margin-bottom: 2px;
+  }
+  .group-item:hover { background: var(--surface2); }
+  .group-item.active { background: var(--accent-glow); border-color: rgba(59,130,246,0.25); }
+  .g-avatar {
+    width: 38px; height: 38px; border-radius: 10px;
+    background: linear-gradient(135deg, #1e3a5f, #3b82f6);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700; color: #fff; flex-shrink: 0;
+  }
+  .g-info { flex: 1; min-width: 0; }
+  .g-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .g-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .g-owner-badge {
+    font-size: 9px; font-weight: 700; background: rgba(59,130,246,0.2);
+    color: var(--accent); border-radius: 4px; padding: 1px 5px; flex-shrink: 0;
+  }
+
+  .empty-sidebar { padding: 30px 16px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.6; }
+  .empty-sidebar .e-icon { font-size: 28px; margin-bottom: 10px; }
+
+  /* Content / Chat area */
+  .content { padding: 0; overflow: hidden; max-height: calc(100vh - 58px); display: flex; flex-direction: column; }
+
+  /* Welcome state */
+  .welcome-state {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    flex: 1; text-align: center; color: var(--muted); padding: 40px;
+  }
+  .welcome-state .w-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
+  .welcome-state h3 { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+  .welcome-state p { font-size: 13px; line-height: 1.6; }
+
+  /* Chat view */
+  #chat-view { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+  #chat-view.visible { display: flex; }
+
+  .chat-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0;
+  }
+  .chat-avatar {
+    width: 44px; height: 44px; border-radius: 12px;
+    background: linear-gradient(135deg, #1e3a5f, #3b82f6);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700; color: #fff;
+  }
+  .chat-info { flex: 1; }
+  .chat-title { font-size: 16px; font-weight: 700; }
+  .chat-type { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  /* Messages */
+  .messages-area {
+    flex: 1; overflow-y: auto; padding: 16px 24px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+
+  .msg-bubble {
+    max-width: 70%; padding: 10px 14px; border-radius: 14px;
+    font-size: 13px; line-height: 1.5; word-break: break-word;
+  }
+  .msg-bubble.incoming {
+    background: var(--surface); border: 1px solid var(--border);
+    align-self: flex-start; border-bottom-left-radius: 4px;
+  }
+  .msg-bubble.outgoing {
+    background: var(--accent); color: #fff;
+    align-self: flex-end; border-bottom-right-radius: 4px;
+  }
+  .msg-sender { font-size: 11px; font-weight: 700; color: var(--accent); margin-bottom: 3px; }
+  .msg-time { font-size: 10px; color: var(--muted); margin-top: 4px; text-align: right; }
+  .outgoing .msg-time { color: rgba(255,255,255,0.65); }
+
+  .msgs-loading { text-align: center; padding: 20px; color: var(--muted); font-size: 13px; }
+  .load-more-btn {
+    text-align: center; padding: 8px;
+  }
+
+  /* Input bar */
+  .input-bar {
+    display: flex; align-items: flex-end; gap: 10px;
+    padding: 12px 16px; border-top: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0;
+  }
+  .input-bar textarea {
+    flex: 1; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 12px; color: var(--text); padding: 10px 14px;
+    font-size: 14px; font-family: inherit; outline: none;
+    resize: none; min-height: 44px; max-height: 140px;
+    transition: border-color .2s; margin-bottom: 0;
+    line-height: 1.4;
+  }
+  .input-bar textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+  .send-fab {
+    width: 44px; height: 44px; border-radius: 12px;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    border: none; cursor: pointer; font-size: 18px; flex-shrink: 0;
+    transition: all .15s;
+  }
+  .send-fab:hover:not(:disabled) { background: #2563eb; }
+  .send-fab:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* Toast */
+  #toasts {
+    position: fixed; bottom: 20px; right: 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 9999; pointer-events: none;
+  }
+  .toast {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 16px;
+    font-size: 13px; font-weight: 500;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+    animation: slideIn .25s ease; pointer-events: all;
+  }
+  .toast-ok { border-left: 3px solid var(--green); }
+  .toast-err { border-left: 3px solid var(--red); }
+  .toast-info { border-left: 3px solid var(--accent); }
+  @keyframes slideIn { from { opacity:0; transform: translateX(20px); } to { opacity:1; transform: none; } }
+
+  /* Loading overlay */
+  #loading-overlay {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9999; font-size: 24px;
+  }
+  .spinner { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  @media (max-width: 680px) {
+    .app-body { grid-template-columns: 1fr; }
+    .sidebar { max-height: 220px; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<!-- Loading Overlay -->
+<div id="loading-overlay">
+  <span class="spinner">⟳</span>
+</div>
+
+<!-- ════════════════════════════════
+     SCREEN 1: FIREBASE AUTH
+════════════════════════════════ -->
+<div id="screen-firebase" class="screen">
+  <div class="auth-card">
+    <div class="logo-wrap">
+      <div class="logo-icon">✈</div>
+      <div class="logo-text">
+        <h1>Telegram Manager</h1>
+        <p>আপনার account দিয়ে login করুন</p>
+      </div>
+    </div>
+
+    <div class="firebase-note">
+      <b>⚠️ Firebase Config:</b> এই ফাইলের উপরে <code>firebaseConfig</code> এ আপনার Firebase project এর তথ্য দিন।
+      <a href="https://console.firebase.google.com" target="_blank" style="color:var(--accent)">Firebase Console →</a>
+    </div>
+
+    <!-- Login Form -->
+    <div id="fb-login-form">
+      <label>Email</label>
+      <input type="email" id="fb-login-email" placeholder="your@email.com" onkeydown="if(event.key==='Enter')fbLogin()">
+      <label>Password</label>
+      <input type="password" id="fb-login-pass" placeholder="Password" onkeydown="if(event.key==='Enter')fbLogin()">
+      <button class="btn btn-primary btn-full" id="fb-login-btn" onclick="fbLogin()">🔐 Login করুন</button>
+      <div class="status-msg" id="fb-login-status"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════
+     SCREEN 2: TELEGRAM LOGIN
+════════════════════════════════ -->
+<div id="screen-login" class="screen">
+  <div class="login-card">
+    <div class="logo-wrap">
+      <div class="logo-icon">✈</div>
+      <div class="logo-text">
+        <h1>Telegram Connect</h1>
+        <p>Personal account দিয়ে connect করুন</p>
+      </div>
+    </div>
+
+    <!-- STEP 1: API Credentials -->
+    <div id="step-creds" class="step active">
+      <div class="note">
+        <b>API ID ও API Hash</b> পাবেন:<br>
+        <a href="https://my.telegram.org" target="_blank">my.telegram.org</a> → API development tools → একটি app তৈরি করুন
+      </div>
+      <label>API ID</label>
+      <input type="text" id="inp-api-id" placeholder="যেমন: 1234567" onkeydown="if(event.key==='Enter')sendCode()">
+      <label>API Hash</label>
+      <input type="text" id="inp-api-hash" placeholder="32 অক্ষরের hash">
+      <label>Phone Number (country code সহ)</label>
+      <input type="text" id="inp-phone" placeholder="+8801XXXXXXXXX" onkeydown="if(event.key==='Enter')sendCode()">
+      <button class="btn btn-primary btn-full" id="btn-send-code" onclick="sendCode()">📨 কোড পাঠান</button>
+      <div class="status-msg" id="status-creds"></div>
+    </div>
+
+    <!-- STEP 2: OTP Code -->
+    <div id="step-code" class="step">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Telegram app বা SMS-এ পাঠানো কোডটি লিখুন।</p>
+      <label>Login Code</label>
+      <input type="text" id="inp-code" placeholder="12345" onkeydown="if(event.key==='Enter')verifyCode()">
+      <div class="btn-row">
+        <button class="btn btn-ghost" onclick="backToCreds()">← পেছনে</button>
+        <button class="btn btn-primary" onclick="verifyCode()">✓ যাচাই করুন</button>
+      </div>
+      <div class="status-msg" id="status-code"></div>
+    </div>
+
+    <!-- STEP 3: 2FA -->
+    <div id="step-pass" class="step">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px">আপনার account-এ Two-Step Verification (2FA) চালু আছে।</p>
+      <label>2FA Password</label>
+      <input type="password" id="inp-pass" placeholder="Password" onkeydown="if(event.key==='Enter')checkPassword()">
+      <button class="btn btn-primary btn-full" onclick="checkPassword()">🔓 Login করুন</button>
+      <div class="status-msg" id="status-pass"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════
+     SCREEN 3: MAIN APP
+════════════════════════════════ -->
+<div id="screen-app" class="screen">
+  <!-- Topbar -->
+  <div class="topbar">
+    <div class="topbar-left">
+      <div class="topbar-logo">✈ TG Manager</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div class="user-pill">
+        <div class="user-avatar" id="top-avatar">?</div>
+        <span id="top-name">—</span>
+      </div>
+      <button class="btn btn-ghost" style="font-size:12px;padding:7px 12px" onclick="fullLogout()">লগআউট</button>
+    </div>
+  </div>
+
+  <div class="app-body">
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="sidebar-top">
+        <div class="sidebar-label">👑 আপনার Groups (Owner)</div>
+        <button class="btn btn-ghost" style="font-size:12px;padding:7px" onclick="loadGroups()">⟳ Refresh</button>
+      </div>
+      <div class="group-list" id="group-list">
+        <div class="empty-sidebar">
+          <div class="e-icon">💬</div><p>Groups লোড হচ্ছে...</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Content: Chat -->
+    <div class="content">
+      <!-- Welcome state -->
+      <div class="welcome-state" id="welcome-state">
+        <div class="w-icon">💬</div>
+        <h3>কোনো group বাছাই করুন</h3>
+        <p>বাম দিকের sidebar থেকে আপনার group-এ click করুন।<br>শুধু যেসব group-এ আপনি <b>Owner</b> সেগুলো দেখাবে।</p>
+      </div>
+
+      <!-- Chat View -->
+      <div id="chat-view">
+        <div class="chat-header">
+          <div class="chat-avatar" id="cv-avatar">?</div>
+          <div class="chat-info">
+            <div class="chat-title" id="cv-title">—</div>
+            <div class="chat-type" id="cv-type">—</div>
+          </div>
+          <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" onclick="loadMoreMessages()">⬆ আগের</button>
+        </div>
+
+        <div class="messages-area" id="messages-area">
+          <div class="msgs-loading">⏳ বার্তা লোড হচ্ছে...</div>
+        </div>
+
+        <div class="input-bar">
+          <textarea id="chat-input" placeholder="Message লিখুন..." rows="1"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}"
+            oninput="autoResize(this)"></textarea>
+          <button class="send-fab" id="send-fab" onclick="sendChatMessage()">✈</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+// ══════════════════════════════════
+//  STATE
+// ══════════════════════════════════
+let acc = { apiId: '', apiHash: '', phone: '', phoneCodeHash: '', loggedIn: false, user: null };
+let dialogs = [];
+let selectedDialog = null;
+let msgOffsetId = 0;
+let myTgId = null;
+let fbUser = null;
+
+// ══════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function initials(name) { return (name||'').split(' ').map(w=>w[0]||'').join('').slice(0,2).toUpperCase() || '?'; }
+function setStatus(id, html) { const el = document.getElementById(id); if (el) el.innerHTML = html; }
+function showStep(id) { document.querySelectorAll('.step').forEach(s=>s.classList.remove('active')); document.getElementById(id).classList.add('active'); }
+function hideLoading() { document.getElementById('loading-overlay').style.display = 'none'; }
+function kindLabel(kind) { return { chat:'Group', megagroup:'Supergroup', channel:'Channel' }[kind] || kind; }
+function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 140) + 'px'; }
+function formatTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('bn-BD', { hour: '2-digit', minute: '2-digit' });
+}
+
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ══════════════════════════════════
+//  LOCAL CACHE (fallback)
+// ══════════════════════════════════
+function saveAccLocal() {
+  try { localStorage.setItem('tgm_acc', JSON.stringify({ apiId:acc.apiId,apiHash:acc.apiHash,phone:acc.phone,loggedIn:acc.loggedIn,user:acc.user })); } catch(e){}
+}
+function loadAccLocal() {
+  try { const s = localStorage.getItem('tgm_acc'); if(s) acc={...acc,...JSON.parse(s)}; } catch(e){}
+}
+
+// ══════════════════════════════════
+//  FIREBASE LOGIN
+// ══════════════════════════════════
+async function fbLogin() {
+  const email = document.getElementById('fb-login-email').value.trim();
+  const pass = document.getElementById('fb-login-pass').value;
+  if (!email || !pass) { setStatus('fb-login-status','<span style="color:var(--red)">❌ Email ও Password দিন</span>'); return; }
+
+  const btn = document.getElementById('fb-login-btn');
+  btn.disabled = true;
+  setStatus('fb-login-status','⏳ Login হচ্ছে...');
+
+  try {
+    await window.fbSignIn(email, pass);
+    // onAuthStateChanged will handle redirect
+  } catch(e) {
+    const msg = e.code === 'auth/user-not-found' ? 'User পাওয়া যায়নি'
+              : e.code === 'auth/wrong-password' ? 'Password ভুল'
+              : e.code === 'auth/invalid-credential' ? 'Email বা Password ভুল'
+              : e.message;
+    setStatus('fb-login-status',`<span style="color:var(--red)">❌ ${esc(msg)}</span>`);
+    btn.disabled = false;
+  }
+}
+
+// ══════════════════════════════════
+//  FIREBASE AUTH STATE LISTENER
+// ══════════════════════════════════
+window.addEventListener('fb-authed', async (e) => {
+  fbUser = e.detail;
+  hideLoading();
+
+  // Load saved TG session from Firestore
+  let fbData = null;
+  try {
+    fbData = await window.fbGetTgSession(fbUser.uid);
+    if (fbData) {
+      if (fbData.tgApiId) acc.apiId = fbData.tgApiId;
+      if (fbData.tgApiHash) acc.apiHash = fbData.tgApiHash;
+      if (fbData.tgPhone) acc.phone = fbData.tgPhone;
+      if (fbData.tgUser) acc.user = fbData.tgUser;
+      if (fbData.tgLoggedIn) acc.loggedIn = fbData.tgLoggedIn;
+      if (fbData.dialogs) dialogs = fbData.dialogs;
+
+      // ── Restore MTProto session keys into localStorage ──
+      // This allows the library to reuse existing auth keys without re-login
+      if (fbData.mtSession && typeof window.tgmRestoreSession === 'function') {
+        const keys = Object.keys(fbData.mtSession);
+        console.log('[TGM] Restoring mtSession keys from Firebase:', keys);
+        window.tgmRestoreSession(fbData.mtSession);
+        console.log('[TGM] Session restored to localStorage ✅');
+      } else {
+        console.log('[TGM] No mtSession found in Firebase data');
+      }
+    }
+  } catch(err) {
+    loadAccLocal(); // fallback
+  }
+
+  if (acc.loggedIn && acc.apiId) {
+    // Try to resume Telegram session using restored auth keys
+    try {
+      await window.tgmConnect(acc.apiId, acc.apiHash);
+      // Verify session is truly alive
+      await window.tgmCall('users.getFullUser', { id: { _: 'inputUserSelf' } });
+      showApp();
+      renderGroupSidebar();
+      loadGroups().catch(()=>{});
+    } catch(err) {
+      // Session invalid — clear old MTProto keys and ask user to re-login
+      if (typeof window.tgmClearSession === 'function') window.tgmClearSession();
+      acc.loggedIn = false;
+      // Update Firebase so tgLoggedIn = false
+      try { await window.fbSaveTgSession(fbUser.uid, { tgLoggedIn: false, mtSession: {} }); } catch(_){}
+      showScreen('screen-login');
+      showStep('step-creds');
+      if (acc.apiId) document.getElementById('inp-api-id').value = acc.apiId;
+      if (acc.apiHash) document.getElementById('inp-api-hash').value = acc.apiHash;
+      if (acc.phone) document.getElementById('inp-phone').value = acc.phone;
+      toast('Session মেয়াদ শেষ — আবার Telegram Login করুন', 'info');
+    }
+  } else {
+    showScreen('screen-login');
+    if (acc.apiId) document.getElementById('inp-api-id').value = acc.apiId;
+    if (acc.apiHash) document.getElementById('inp-api-hash').value = acc.apiHash;
+    if (acc.phone) document.getElementById('inp-phone').value = acc.phone;
+  }
+});
+
+window.addEventListener('fb-signed-out', () => {
+  hideLoading();
+  showScreen('screen-firebase');
+});
+
+// ══════════════════════════════════
+//  TELEGRAM LOGIN FLOW
+// ══════════════════════════════════
+async function sendCode() {
+  const apiId = document.getElementById('inp-api-id').value.trim();
+  const apiHash = document.getElementById('inp-api-hash').value.trim();
+  const phone = document.getElementById('inp-phone').value.trim().replace(/[^\d+]/g, '');
+
+  if (!apiId || !/^\d+$/.test(apiId)) { setStatus('status-creds','<span style="color:var(--red)">❌ সঠিক API ID দিন</span>'); return; }
+  if (!apiHash || apiHash.length < 10) { setStatus('status-creds','<span style="color:var(--red)">❌ সঠিক API Hash দিন</span>'); return; }
+  if (!phone || !phone.replace('+','').match(/^\d{6,15}$/)) { setStatus('status-creds','<span style="color:var(--red)">❌ Country code সহ Phone Number দিন</span>'); return; }
+
+  const btn = document.getElementById('btn-send-code');
+  btn.disabled = true;
+  setStatus('status-creds','⏳ সংযোগ হচ্ছে...');
+
+  try {
+    await window.tgmConnect(apiId, apiHash);
+    const result = await window.tgmCall('auth.sendCode', { phone_number: phone, settings: { _: 'codeSettings' } });
+    acc.apiId = apiId; acc.apiHash = apiHash; acc.phone = phone;
+    acc.phoneCodeHash = result.phone_code_hash;
+    showStep('step-code');
+    setStatus('status-code','<span style="color:var(--green)">✅ কোড পাঠানো হয়েছে — Telegram app চেক করুন</span>');
+  } catch(e) {
+    setStatus('status-creds',`<span style="color:var(--red)">❌ ব্যর্থ: ${esc(e.error_message||e.message||'অজানা সমস্যা')}</span>`);
+  }
+  btn.disabled = false;
+}
+
+function backToCreds() { showStep('step-creds'); setStatus('status-creds',''); }
+
+async function verifyCode() {
+  const code = document.getElementById('inp-code').value.trim();
+  if (!code) { setStatus('status-code','<span style="color:var(--red)">❌ কোড লিখুন</span>'); return; }
+  setStatus('status-code','⏳ যাচাই হচ্ছে...');
+  try {
+    const result = await window.tgmCall('auth.signIn', {
+      phone_number: acc.phone, phone_code_hash: acc.phoneCodeHash, phone_code: code
+    });
+    await finishLogin(result.user);
+  } catch(e) {
+    if ((e.error_message||'') === 'SESSION_PASSWORD_NEEDED') {
+      showStep('step-pass');
+      setStatus('status-pass','<span style="color:var(--yellow)">🔒 2FA Password প্রয়োজন</span>');
+    } else {
+      setStatus('status-code',`<span style="color:var(--red)">❌ ব্যর্থ: ${esc(e.error_message||e.message||'অজানা সমস্যা')}</span>`);
+    }
+  }
+}
+
+async function checkPassword() {
+  const password = document.getElementById('inp-pass').value;
+  if (!password) { setStatus('status-pass','<span style="color:var(--red)">❌ Password দিন</span>'); return; }
+  setStatus('status-pass','⏳ যাচাই হচ্ছে...');
+  try {
+    const pwInfo = await window.tgmCall('account.getPassword');
+    const { A, M1 } = await window.tgmGetSRPParams({
+      g: pwInfo.current_algo.g, p: pwInfo.current_algo.p,
+      salt1: pwInfo.current_algo.salt1, salt2: pwInfo.current_algo.salt2,
+      gB: pwInfo.srp_B, password
+    });
+    const result = await window.tgmCall('auth.checkPassword', {
+      password: { _:'inputCheckPasswordSRP', srp_id: pwInfo.srp_id, A, M1 }
+    });
+    await finishLogin(result.user);
+  } catch(e) {
+    setStatus('status-pass',`<span style="color:var(--red)">❌ ব্যর্থ: ${esc(e.error_message||e.message||'অজানা সমস্যা')}</span>`);
+  }
+}
+
+async function finishLogin(user) {
+  acc.loggedIn = true;
+  acc.user = { id: user.id, firstName: user.first_name, lastName: user.last_name, username: user.username };
+  myTgId = user.id;
+
+  // Wait for MTProto library to finish writing session keys to localStorage
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Collect ALL localStorage keys (MTProto writes dc1_auth_key, dc2_auth_key, dc, etc.)
+  const mtSession = (typeof window.tgmCollectSession === 'function') ? window.tgmCollectSession() : {};
+
+  // Debug: log what we found
+  if (typeof window.tgmDebugSession === 'function') window.tgmDebugSession();
+  console.log('[TGM] Saving mtSession keys:', Object.keys(mtSession));
+
+  // Save everything to Firebase
+  if (fbUser) {
+    try {
+      await window.fbSaveTgSession(fbUser.uid, {
+        tgApiId: acc.apiId, tgApiHash: acc.apiHash,
+        tgPhone: acc.phone, tgLoggedIn: true,
+        tgUser: acc.user, updatedAt: Date.now(),
+        mtSession: mtSession
+      });
+      console.log('[TGM] Session saved to Firebase ✅');
+    } catch(e) {
+      console.error('[TGM] Firebase save failed:', e);
+      saveAccLocal();
+    }
+  } else { saveAccLocal(); }
+
+  ['inp-code','inp-pass'].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+  toast('Telegram Login সফল! 🎉','ok');
+  showApp();
+  await loadGroups();
+}
+
+function showApp() {
+  showScreen('screen-app');
+  const name = [acc.user?.firstName, acc.user?.lastName].filter(Boolean).join(' ') || 'User';
+  document.getElementById('top-avatar').textContent = initials(name);
+  document.getElementById('top-name').textContent = name;
+  myTgId = acc.user?.id;
+}
+
+async function fullLogout() {
+  // Logout from Telegram
+  try { await window.tgmCall('auth.logOut'); } catch(e) {}
+  window.tgmReset();
+
+  // Clear MTProto session from localStorage
+  if (typeof window.tgmClearSession === 'function') window.tgmClearSession();
+
+  // Update Firebase — clear session data
+  if (fbUser) {
+    try {
+      await window.fbSaveTgSession(fbUser.uid, { tgLoggedIn: false, tgUser: null, mtSession: {} });
+    } catch(e) {}
+  }
+
+  // Clear local state
+  acc = { apiId:'',apiHash:'',phone:'',phoneCodeHash:'',loggedIn:false,user:null };
+  dialogs = []; selectedDialog = null;
+  try { localStorage.removeItem('tgm_acc'); localStorage.removeItem('tgm_dialogs'); } catch(e) {}
+
+  // Logout from Firebase
+  try { await window.fbSignOut(); } catch(e) {}
+  // fb-signed-out event will redirect to firebase auth screen
+}
+
+// ══════════════════════════════════
+//  LOAD GROUPS (Owner only)
+// ══════════════════════════════════
+function inputPeerFromDialog(peer, chats, users) {
+  if (peer._ === 'peerChat') return { _:'inputPeerChat', chat_id: peer.chat_id };
+  if (peer._ === 'peerChannel') {
+    const c = chats.find(x => x.id === peer.channel_id);
+    return { _:'inputPeerChannel', channel_id: peer.channel_id, access_hash: c?.access_hash||0 };
+  }
+  return { _:'inputPeerEmpty' };
+}
+
+async function loadGroups() {
+  const listEl = document.getElementById('group-list');
+  listEl.innerHTML = '<div class="empty-sidebar"><div class="e-icon">⏳</div><p>লোড হচ্ছে...</p></div>';
+
+  const collected = new Map();
+  let offsetDate=0, offsetId=0, offsetPeer={ _:'inputPeerEmpty' };
+
+  try {
+    for (let page=0; page<25; page++) {
+      const result = await window.tgmCall('messages.getDialogs', {
+        offset_date: offsetDate, offset_id: offsetId,
+        offset_peer: offsetPeer, limit: 100, hash: 0
+      });
+      const chats = result.chats || [];
+      const dialogs2 = result.dialogs || [];
+      const users = result.users || [];
+
+      chats.forEach(c => {
+        // Only include groups/supergroups where user is creator (owner)
+        if (c._ === 'chat' && !c.left && !c.deactivated && c.creator) {
+          collected.set(c.id, { id:c.id, accessHash:null, title:c.title, kind:'chat', membersCount:c.participants_count||null, isOwner:true });
+        } else if (c._ === 'channel' && !c.left && c.creator) {
+          // c.creator = true means owner
+          collected.set(c.id, { id:c.id, accessHash:c.access_hash, title:c.title, kind:c.megagroup?'megagroup':'channel', membersCount:c.participants_count||null, isOwner:true });
+        }
+      });
+
+      if (dialogs2.length < 100) break;
+      const last = dialogs2[dialogs2.length-1];
+      const lastMsg = (result.messages||[]).find(m => m.id === last.top_message);
+      offsetId = lastMsg ? lastMsg.id : 0;
+      offsetDate = lastMsg ? lastMsg.date : 0;
+      offsetPeer = inputPeerFromDialog(last.peer, chats, users);
+      if (!offsetId) break;
+    }
+
+    dialogs = Array.from(collected.values());
+
+    // Save to Firebase
+    if (fbUser) {
+      try { await window.fbUpdateTgDialogs(fbUser.uid, dialogs); } catch(e) {}
+    }
+
+    renderGroupSidebar();
+    toast(`${dialogs.length} টি owner group পাওয়া গেছে`, 'ok');
+  } catch(e) {
+    listEl.innerHTML = `<div class="empty-sidebar" style="color:var(--red)"><div class="e-icon">❌</div><p>${esc(e.error_message||e.message||'লোড ব্যর্থ')}</p></div>`;
+    toast('Group লোড ব্যর্থ: '+(e.error_message||e.message), 'err');
+  }
+}
+
+function renderGroupSidebar() {
+  const el = document.getElementById('group-list');
+  if (dialogs.length === 0) {
+    el.innerHTML = '<div class="empty-sidebar"><div class="e-icon">👑</div><p>আপনি কোনো group-এর Owner নন</p></div>';
+    return;
+  }
+  el.innerHTML = dialogs.map(d => `
+    <div class="group-item" id="gi-${d.id}" onclick="openGroup(${d.id})">
+      <div class="g-avatar">${initials(d.title)}</div>
+      <div class="g-info">
+        <div class="g-name">${esc(d.title)}</div>
+        <div class="g-meta">${kindLabel(d.kind)}${d.membersCount ? ' · '+d.membersCount : ''}</div>
+      </div>
+      <div class="g-owner-badge">OWNER</div>
+    </div>
+  `).join('');
+}
+
+// ══════════════════════════════════
+//  OPEN GROUP → SHOW MESSAGES
+// ══════════════════════════════════
+async function openGroup(id) {
+  selectedDialog = dialogs.find(d => d.id === id);
+  if (!selectedDialog) return;
+
+  // Sidebar active state
+  document.querySelectorAll('.group-item').forEach(el => el.classList.remove('active'));
+  const gi = document.getElementById('gi-'+id);
+  if (gi) gi.classList.add('active');
+
+  // Update chat header
+  document.getElementById('cv-avatar').textContent = initials(selectedDialog.title);
+  document.getElementById('cv-title').textContent = selectedDialog.title;
+  document.getElementById('cv-type').textContent = kindLabel(selectedDialog.kind) + (selectedDialog.membersCount ? ' · '+selectedDialog.membersCount+' সদস্য' : '');
+
+  // Show chat view
+  document.getElementById('welcome-state').style.display = 'none';
+  const chatView = document.getElementById('chat-view');
+  chatView.classList.add('visible');
+
+  // Reset & load messages
+  msgOffsetId = 0;
+  document.getElementById('messages-area').innerHTML = '<div class="msgs-loading">⏳ বার্তা লোড হচ্ছে...</div>';
+  await fetchMessages(true);
+}
+
+function buildPeer(d) {
+  if (!d) return { _:'inputPeerEmpty' };
+  if (d.kind === 'chat') return { _:'inputPeerChat', chat_id: d.id };
+  return { _:'inputPeerChannel', channel_id: d.id, access_hash: d.accessHash || 0 };
+}
+
+async function fetchMessages(reset=false) {
+  if (!selectedDialog) return;
+  const area = document.getElementById('messages-area');
+
+  try {
+    const result = await window.tgmCall('messages.getHistory', {
+      peer: buildPeer(selectedDialog),
+      offset_id: msgOffsetId,
+      offset_date: 0, add_offset: 0,
+      limit: 30, max_id: 0, min_id: 0, hash: 0
+    });
+
+    const msgs = (result.messages || []).filter(m => m._ === 'message');
+    const usersMap = {};
+    (result.users||[]).forEach(u => { usersMap[u.id] = u; });
+
+    if (reset) area.innerHTML = '';
+    if (msgs.length === 0 && reset) {
+      area.innerHTML = '<div class="msgs-loading" style="color:var(--muted)">কোনো বার্তা নেই</div>';
+      return;
+    }
+
+    // Messages come newest first — reverse for display
+    const sorted = [...msgs].reverse();
+    sorted.forEach(m => {
+      const isOut = m.out;
+      const sender = usersMap[m.from_id?.user_id];
+      const senderName = sender ? [sender.first_name, sender.last_name].filter(Boolean).join(' ') : 'Unknown';
+
+      const bubble = document.createElement('div');
+      bubble.className = `msg-bubble ${isOut ? 'outgoing' : 'incoming'}`;
+      bubble.innerHTML = `
+        ${!isOut && sender ? `<div class="msg-sender">${esc(senderName)}</div>` : ''}
+        ${esc(m.message || '[Media]')}
+        <div class="msg-time">${formatTime(m.date)}</div>
+      `;
+      if (reset) area.appendChild(bubble);
+      else area.insertBefore(bubble, area.firstChild);
+    });
+
+    if (msgs.length > 0) msgOffsetId = msgs[msgs.length-1].id;
+    if (reset) area.scrollTop = area.scrollHeight;
+
+  } catch(e) {
+    if (reset) area.innerHTML = `<div class="msgs-loading" style="color:var(--red)">❌ ${esc(e.error_message||e.message||'লোড ব্যর্থ')}</div>`;
+    toast('বার্তা লোড ব্যর্থ','err');
+  }
+}
+
+async function loadMoreMessages() {
+  await fetchMessages(false);
+}
+
+// ══════════════════════════════════
+//  SEND MESSAGE
+// ══════════════════════════════════
+async function sendChatMessage() {
+  if (!selectedDialog) return;
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  const fab = document.getElementById('send-fab');
+  fab.disabled = true;
+  input.disabled = true;
+
+  try {
+    await window.tgmCall('messages.sendMessage', {
+      peer: buildPeer(selectedDialog),
+      message: text,
+      random_id: Math.floor(Math.random() * 2147483647)
+    });
+
+    input.value = '';
+    input.style.height = 'auto';
+
+    // Add message to UI immediately
+    const area = document.getElementById('messages-area');
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble outgoing';
+    bubble.innerHTML = `${esc(text)}<div class="msg-time">${formatTime(Math.floor(Date.now()/1000))}</div>`;
+    area.appendChild(bubble);
+    area.scrollTop = area.scrollHeight;
+
+  } catch(e) {
+    toast('পাঠানো ব্যর্থ: '+(e.error_message||e.message),'err');
+  }
+
+  fab.disabled = false;
+  input.disabled = false;
+  input.focus();
+}
+
+// ══════════════════════════════════
+//  INIT — wait for Firebase auth
+// ══════════════════════════════════
+// Loading overlay stays until firebase auth fires
+// (either fb-authed or fb-signed-out event)
+// Timeout fallback in case Firebase config is wrong
+setTimeout(() => {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay.style.display !== 'none') {
+    hideLoading();
+    showScreen('screen-firebase');
+  }
+}, 5000);
+</script>
+</body>
+</html>
